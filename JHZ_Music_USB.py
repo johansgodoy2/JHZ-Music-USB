@@ -1,242 +1,394 @@
 import os
 import sys
+import shutil
 import queue
 import threading
-import string
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+from tkinter.scrolledtext import ScrolledText
 
-try:
-    import yt_dlp
-except ImportError:
-    yt_dlp = None
+import yt_dlp
 
 
 APP_NAME = "JHZ Music USB"
 
 
-class MusicUSBApp:
+def get_ffmpeg_location():
+    """Encuentra FFmpeg incluido en el EXE o instalado en el sistema."""
+
+    if getattr(sys, "frozen", False):
+        base_path = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+
+        ffmpeg = os.path.join(base_path, "ffmpeg.exe")
+        ffprobe = os.path.join(base_path, "ffprobe.exe")
+
+        if os.path.isfile(ffmpeg) and os.path.isfile(ffprobe):
+            return base_path
+
+    local_vendor = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "vendor"
+    )
+
+    ffmpeg = os.path.join(local_vendor, "ffmpeg.exe")
+    ffprobe = os.path.join(local_vendor, "ffprobe.exe")
+
+    if os.path.isfile(ffmpeg) and os.path.isfile(ffprobe):
+        return local_vendor
+
+    if shutil.which("ffmpeg") and shutil.which("ffprobe"):
+        return None
+
+    return None
+
+
+class QueueLogger:
+    def __init__(self, events):
+        self.events = events
+
+    def debug(self, message):
+        pass
+
+    def warning(self, message):
+        self.events.put(("log", "Aviso: " + str(message)))
+
+    def error(self, message):
+        self.events.put(("log", "Error: " + str(message)))
+
+
+class JHZMusicUSB:
+
     def __init__(self, root):
         self.root = root
         self.root.title(APP_NAME)
-        self.root.geometry("700x560")
-        self.root.minsize(620, 500)
+        self.root.geometry("650x540")
+        self.root.minsize(580, 480)
+
         self.events = queue.Queue()
-        self.worker = None
-        self.running = False
+        self.downloading = False
 
-        self.url_var = tk.StringVar()
-        self.dest_var = tk.StringVar()
-        self.quality_var = tk.StringVar(value="192")
-        self.status_var = tk.StringVar(value="Listo para comenzar.")
-        self.progress_var = tk.DoubleVar(value=0)
+        self.destination = tk.StringVar()
+        self.url = tk.StringVar()
+        self.quality = tk.StringVar(value="320")
 
-        self.build_ui()
-        self.refresh_drives()
-        self.root.after(150, self.process_events)
+        self.create_interface()
+        self.root.after(100, self.process_events)
 
-    def build_ui(self):
-        style = ttk.Style()
-        try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
+    def create_interface(self):
 
-        outer = ttk.Frame(self.root, padding=22)
-        outer.pack(fill="both", expand=True)
+        main = ttk.Frame(self.root, padding=18)
+        main.pack(fill="both", expand=True)
 
-        header = ttk.Frame(outer)
-        header.pack(fill="x", pady=(0, 18))
-        ttk.Label(header, text="JHZ Music USB", font=("Segoe UI", 22, "bold")).pack(anchor="w")
-        ttk.Label(
-            header,
-            text="Convierte playlists en archivos MP3 individuales y guárdalos en tu USB.",
-            font=("Segoe UI", 10)
-        ).pack(anchor="w", pady=(4, 0))
-
-        ttk.Label(outer, text="1. Enlace de YouTube o playlist", font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        self.url_entry = ttk.Entry(outer, textvariable=self.url_var, font=("Segoe UI", 10))
-        self.url_entry.pack(fill="x", pady=(6, 16))
-        self.url_entry.focus_set()
-
-        ttk.Label(outer, text="2. Carpeta de destino (elige tu pendrive)", font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        dest_row = ttk.Frame(outer)
-        dest_row.pack(fill="x", pady=(6, 16))
-        self.dest_entry = ttk.Entry(dest_row, textvariable=self.dest_var)
-        self.dest_entry.pack(side="left", fill="x", expand=True)
-        ttk.Button(dest_row, text="Examinar…", command=self.choose_folder).pack(side="left", padx=(8, 0))
-        ttk.Button(dest_row, text="Detectar USB", command=self.refresh_drives).pack(side="left", padx=(8, 0))
-
-        ttk.Label(outer, text="3. Calidad MP3", font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        quality_row = ttk.Frame(outer)
-        quality_row.pack(fill="x", pady=(6, 16))
-        quality = ttk.Combobox(
-            quality_row, textvariable=self.quality_var,
-            values=["128", "192", "256", "320"], state="readonly", width=10
+        title = ttk.Label(
+            main,
+            text="JHZ MUSIC USB",
+            font=("Arial", 22, "bold")
         )
-        quality.pack(side="left")
-        ttk.Label(quality_row, text="kbps  ·  192 kbps es una buena opción general.").pack(side="left", padx=10)
+        title.pack(pady=(0, 5))
 
-        ttk.Separator(outer).pack(fill="x", pady=8)
-        self.start_button = ttk.Button(outer, text="COMENZAR DESCARGA Y COPIA", command=self.start)
-        self.start_button.pack(fill="x", ipady=9, pady=(8, 12))
-
-        self.progress = ttk.Progressbar(outer, variable=self.progress_var, maximum=100, mode="determinate")
-        self.progress.pack(fill="x", pady=(2, 7))
-        ttk.Label(outer, textvariable=self.status_var, wraplength=640).pack(anchor="w")
-
-        self.log = tk.Text(outer, height=9, wrap="word", font=("Consolas", 9), state="disabled")
-        self.log.pack(fill="both", expand=True, pady=(12, 0))
-
-        footer = (
-            "Nota: los MP3 se guardan directamente en la carpeta elegida. "
-            "Las canciones descargadas anteriormente se omiten cuando sea posible."
+        subtitle = ttk.Label(
+            main,
+            text="Descarga y convierte tu música a MP3"
         )
-        ttk.Label(outer, text=footer, wraplength=640, foreground="#666666").pack(anchor="w", pady=(10, 0))
+        subtitle.pack(pady=(0, 20))
 
-    def add_log(self, message):
-        self.log.configure(state="normal")
-        self.log.insert("end", message + "\n")
-        self.log.see("end")
-        self.log.configure(state="disabled")
+        ttk.Label(main, text="Enlace de YouTube:").pack(anchor="w")
 
-    def choose_folder(self):
-        folder = filedialog.askdirectory(title="Selecciona una carpeta del pendrive")
+        self.url_entry = ttk.Entry(
+            main,
+            textvariable=self.url
+        )
+        self.url_entry.pack(fill="x", pady=(5, 12))
+
+        ttk.Label(main, text="Carpeta de destino:").pack(anchor="w")
+
+        folder_frame = ttk.Frame(main)
+        folder_frame.pack(fill="x", pady=(5, 12))
+
+        self.folder_entry = ttk.Entry(
+            folder_frame,
+            textvariable=self.destination
+        )
+        self.folder_entry.pack(side="left", fill="x", expand=True)
+
+        self.folder_button = ttk.Button(
+            folder_frame,
+            text="Examinar",
+            command=self.select_folder
+        )
+        self.folder_button.pack(side="right", padx=(8, 0))
+
+        ttk.Label(main, text="Calidad del MP3:").pack(anchor="w")
+
+        quality_box = ttk.Combobox(
+            main,
+            textvariable=self.quality,
+            values=["128", "192", "256", "320"],
+            state="readonly",
+            width=12
+        )
+        quality_box.pack(anchor="w", pady=(5, 15))
+
+        self.start_button = ttk.Button(
+            main,
+            text="DESCARGAR MÚSICA",
+            command=self.start_download
+        )
+        self.start_button.pack(fill="x", ipady=7, pady=(0, 15))
+
+        self.status_label = ttk.Label(
+            main,
+            text="Esperando descarga..."
+        )
+        self.status_label.pack(anchor="w")
+
+        self.progress = ttk.Progressbar(
+            main,
+            mode="determinate",
+            maximum=100
+        )
+        self.progress.pack(fill="x", pady=(7, 15))
+
+        ttk.Label(main, text="Registro de actividad:").pack(anchor="w")
+
+        self.log_box = ScrolledText(
+            main,
+            height=11,
+            state="disabled",
+            font=("Consolas", 9)
+        )
+        self.log_box.pack(fill="both", expand=True, pady=(5, 0))
+
+        footer = ttk.Label(
+            main,
+            text="JHZ Music USB | Conversión automática a MP3"
+        )
+        footer.pack(pady=(12, 0))
+
+    def select_folder(self):
+
+        folder = filedialog.askdirectory(
+            title="Selecciona la carpeta de tu pendrive"
+        )
+
         if folder:
-            self.dest_var.set(folder)
+            self.destination.set(folder)
 
-    def refresh_drives(self):
-        drives = []
-        if os.name == "nt":
-            for letter in string.ascii_uppercase:
-                path = f"{letter}:\\"
-                if os.path.exists(path):
-                    drives.append(path)
-        if drives:
-            self.add_log("Unidades detectadas: " + ", ".join(drives))
-            if not self.dest_var.get():
-                # No se elige automáticamente: el usuario confirma el destino.
-                self.status_var.set("Unidades detectadas. Selecciona la carpeta de tu pendrive.")
-        else:
-            self.add_log("No se detectaron unidades extraíbles automáticamente. Puedes usar Examinar…")
+    def log(self, message):
 
-    def start(self):
-        if yt_dlp is None:
-            messagebox.showerror(
-                "Falta yt-dlp",
-                "No está instalado yt-dlp. Ejecuta primero INSTALAR.bat dentro de la carpeta del programa."
+        self.log_box.configure(state="normal")
+        self.log_box.insert("end", str(message) + "\n")
+        self.log_box.see("end")
+        self.log_box.configure(state="disabled")
+
+    def start_download(self):
+
+        if self.downloading:
+            return
+
+        url = self.url.get().strip()
+        destination = self.destination.get().strip()
+
+        if not url:
+            messagebox.showwarning(
+                APP_NAME,
+                "Introduce un enlace de YouTube."
             )
             return
-        url = self.url_var.get().strip()
-        dest = self.dest_var.get().strip()
-        if not url:
-            messagebox.showwarning("Falta el enlace", "Pega el enlace de un video o playlist de YouTube.")
-            return
-        if not dest or not os.path.isdir(dest):
-            messagebox.showwarning("Destino no válido", "Selecciona una carpeta existente del pendrive.")
-            return
-        if not os.access(dest, os.W_OK):
-            messagebox.showerror("Sin permisos", "No se puede escribir en la carpeta seleccionada.")
-            return
-        if self.running:
+
+        if not destination:
+            messagebox.showwarning(
+                APP_NAME,
+                "Selecciona la carpeta de destino."
+            )
             return
 
-        self.running = True
+        if not os.path.isdir(destination):
+            messagebox.showerror(
+                APP_NAME,
+                "La carpeta de destino no existe."
+            )
+            return
+
+        if not os.access(destination, os.W_OK):
+            messagebox.showerror(
+                APP_NAME,
+                "No se puede escribir en esta carpeta."
+            )
+            return
+
+        self.downloading = True
         self.start_button.configure(state="disabled")
-        self.progress_var.set(0)
-        self.status_var.set("Iniciando…")
-        self.add_log("Iniciando tarea. Los archivos MP3 se guardarán en: " + dest)
+        self.folder_button.configure(state="disabled")
+        self.progress["value"] = 0
+        self.status_label.configure(text="Preparando descarga...")
 
-        self.worker = threading.Thread(
+        self.log("Iniciando proceso...")
+        self.log("Destino: " + destination)
+
+        thread = threading.Thread(
             target=self.download_worker,
-            args=(url, dest, self.quality_var.get()),
+            args=(url, destination, self.quality.get()),
             daemon=True
         )
-        self.worker.start()
+        thread.start()
 
-    def download_worker(self, url, dest, quality):
-        archive = os.path.join(dest, ".jhz_music_usb_archive.txt")
+    def download_worker(self, url, destination, quality):
 
-        def hook(data):
-            status = data.get("status")
-            if status == "downloading":
-                total = data.get("total_bytes") or data.get("total_bytes_estimate")
+        archive = os.path.join(
+            destination,
+            ".jhz_downloaded.txt"
+        )
+
+        ffmpeg_location = get_ffmpeg_location()
+
+        if ffmpeg_location is None and not (
+            shutil.which("ffmpeg") and shutil.which("ffprobe")
+        ):
+            self.events.put((
+                "error",
+                "No se encontró FFmpeg. Comprueba la compilación."
+            ))
+            return
+
+        def progress_hook(data):
+
+            if data.get("status") == "downloading":
+
+                total = (
+                    data.get("total_bytes")
+                    or data.get("total_bytes_estimate")
+                )
+
                 downloaded = data.get("downloaded_bytes", 0)
-                percent = (downloaded / total * 100) if total else 0
-                name = os.path.basename(data.get("filename", ""))
-                self.events.put(("progress", percent, f"Descargando: {name[:75]}"))
-            elif status == "finished":
-                name = os.path.basename(data.get("filename", ""))
-                self.events.put(("log", "Audio descargado; convirtiendo a MP3: " + name))
 
-        def logger_message(message):
-            self.events.put(("log", str(message).strip()))
+                if total:
+                    percentage = downloaded / total * 100
+
+                    self.events.put((
+                        "progress",
+                        percentage,
+                        "Descargando..."
+                    ))
+
+            elif data.get("status") == "finished":
+
+                self.events.put((
+                    "progress",
+                    100,
+                    "Convirtiendo a MP3..."
+                ))
 
         options = {
             "format": "bestaudio/best",
-            "outtmpl": os.path.join(dest, "%(title)s.%(ext)s"),
+
+            "outtmpl": os.path.join(
+                destination,
+                "%(title).180B [%(id)s].%(ext)s"
+            ),
+
             "noplaylist": False,
             "ignoreerrors": True,
             "nooverwrites": True,
             "continuedl": True,
-            "windowsfilenames": True,
             "download_archive": archive,
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": quality,
-            }],
-            "progress_hooks": [hook],
-            "logger": type("QueueLogger", (), {
-                "debug": lambda _self, msg: None,
-                "warning": lambda _self, msg: logger_message("Aviso: " + msg),
-                "error": lambda _self, msg: logger_message("Error: " + msg),
-            })(),
+
+            "writethumbnail": False,
+            "write_all_thumbnails": False,
+            "embedthumbnail": False,
+
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": quality,
+                }
+            ],
+
+            "keepvideo": False,
+
+            "progress_hooks": [progress_hook],
+
+            "logger": QueueLogger(self.events),
+
             "quiet": True,
             "noprogress": True,
-            "extract_flat": False,
         }
 
+        if ffmpeg_location:
+            options["ffmpeg_location"] = ffmpeg_location
+
         try:
-            with yt_dlp.YoutubeDL(options) as ydl:
-                info = ydl.extract_info(url, download=True)
-            if info is None:
-                self.events.put(("done", False, "No se pudo procesar el enlace. Comprueba que sea válido y accesible."))
-            else:
-                self.events.put(("progress", 100, "Proceso terminado."))
-                self.events.put(("done", True, "Tarea finalizada. Revisa los archivos MP3 en tu pendrive."))
-        except Exception as exc:
-            self.events.put(("done", False, f"No se pudo completar la tarea: {exc}"))
+            with yt_dlp.YoutubeDL(options) as downloader:
+                downloader.download([url])
+
+            self.events.put(("finished", None))
+
+        except Exception as error:
+            self.events.put(("error", str(error)))
 
     def process_events(self):
+
         try:
             while True:
                 event = self.events.get_nowait()
-                kind = event[0]
-                if kind == "progress":
-                    self.progress_var.set(max(0, min(100, event[1])))
-                    self.status_var.set(event[2])
-                elif kind == "log":
-                    self.add_log(event[1])
-                elif kind == "done":
-                    self.running = False
+                event_type = event[0]
+
+                if event_type == "log":
+                    self.log(event[1])
+
+                elif event_type == "progress":
+                    percentage = event[1]
+                    status = event[2]
+
+                    self.progress["value"] = percentage
+                    self.status_label.configure(text=status)
+
+                elif event_type == "finished":
+                    self.downloading = False
+
+                    self.progress["value"] = 100
+                    self.status_label.configure(
+                        text="Proceso finalizado."
+                    )
+
+                    self.log("Proceso finalizado.")
+                    self.log("Revisa tu carpeta de destino.")
+
                     self.start_button.configure(state="normal")
-                    self.status_var.set(event[2])
-                    self.add_log(event[2])
-                    if event[1]:
-                        messagebox.showinfo("JHZ Music USB", event[2])
-                    else:
-                        messagebox.showerror("JHZ Music USB", event[2] + "\n\nComprueba que FFmpeg esté instalado y que el enlace sea accesible.")
+                    self.folder_button.configure(state="normal")
+
+                    messagebox.showinfo(
+                        APP_NAME,
+                        "El proceso de descarga ha terminado."
+                    )
+
+                elif event_type == "error":
+                    self.downloading = False
+
+                    self.status_label.configure(
+                        text="Se produjo un error."
+                    )
+
+                    self.log("ERROR: " + event[1])
+
+                    self.start_button.configure(state="normal")
+                    self.folder_button.configure(state="normal")
+
+                    messagebox.showerror(
+                        APP_NAME,
+                        "No se pudo completar el proceso:\n\n"
+                        + event[1]
+                    )
+
         except queue.Empty:
             pass
-        self.root.after(150, self.process_events)
 
-
-def main():
-    root = tk.Tk()
-    MusicUSBApp(root)
-    root.mainloop()
+        self.root.after(100, self.process_events)
 
 
 if __name__ == "__main__":
-    main()
+
+    root = tk.Tk()
+    app = JHZMusicUSB(root)
+    root.mainloop()
