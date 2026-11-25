@@ -1,1 +1,71 @@
+name: Build JHZ Music USB for Windows
 
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python (only on the build server)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install application dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install yt-dlp pyinstaller
+
+      - name: Download FFmpeg
+        shell: pwsh
+        run: |
+          $url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+          Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
+          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg-unpacked -Force
+          $ffmpeg = Get-ChildItem -Path ffmpeg-unpacked -Filter ffmpeg.exe -Recurse | Select-Object -First 1
+          $ffprobe = Get-ChildItem -Path ffmpeg-unpacked -Filter ffprobe.exe -Recurse | Select-Object -First 1
+          New-Item -ItemType Directory -Force -Path vendor | Out-Null
+          Copy-Item $ffmpeg.FullName vendor/ffmpeg.exe
+          Copy-Item $ffprobe.FullName vendor/ffprobe.exe
+
+      - name: Build standalone executable
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean --onefile --windowed `
+            --name "JHZ Music USB" `
+            --collect-all yt_dlp `
+            --add-binary "vendor/ffmpeg.exe;." `
+            --add-binary "vendor/ffprobe.exe;." `
+            JHZ_Music_USB.py
+
+      - name: Prepare download package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Copy-Item "dist/JHZ Music USB.exe" release/
+          @"
+          JHZ Music USB
+
+          Ejecuta "JHZ Music USB.exe" con doble clic.
+          No necesitas instalar Python ni FFmpeg en tu PC.
+
+          Pega el enlace de un video o playlist, selecciona una carpeta
+          de destino en tu pendrive y pulsa COMENZAR.
+
+          Usa únicamente contenido que tengas derecho a descargar y respeta
+          los derechos de autor y las condiciones de YouTube.
+          "@ | Set-Content -Encoding UTF8 release/LEEME.txt
+
+      - name: Upload Windows executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: JHZ-Music-USB-Windows
+          path: release/*
+          if-no-files-found: error
